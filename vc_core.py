@@ -1,108 +1,202 @@
-"""
-(2, 2) Visual Cryptography Scheme (Naor-Shamir) and Statistical Metrics
-"""
+"""Core routines for a small (2, 2) visual cryptography laboratory."""
+
+from __future__ import annotations
+
+import secrets
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 
-def preprocess_image(image: Image.Image, threshold: int = 128) -> np.ndarray:
-    """图像灰度化与二值化处理 (0: 黑色, 1: 白色)"""
-    gray = image.convert("L")
-    return (np.array(gray) > threshold).astype(np.uint8)
+def preprocess_image(
+    image: Image.Image, threshold: int = 128, max_side: int = 320
+) -> np.ndarray:
+    """Return a small binary image (0 = black, 1 = white).
+
+    EXIF orientation is respected, transparency is composited over white, and
+    large uploads are resized before the shares expand each source pixel 2x2.
+    """
+    if not 0 <= threshold <= 255:
+        raise ValueError("threshold must be between 0 and 255")
+    if max_side < 1:
+        raise ValueError("max_side must be positive")
+
+    oriented = ImageOps.exif_transpose(image)
+    rgba = oriented.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    gray = Image.alpha_composite(background, rgba).convert("L")
+
+    width, height = gray.size
+    scale = min(1.0, max_side / max(width, height))
+    if scale < 1.0:
+        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        gray = gray.resize(new_size, Image.Resampling.LANCZOS)
+
+    return (np.asarray(gray) > threshold).astype(np.uint8)
 
 
 def encrypt_visual_share(binary_img: np.ndarray) -> tuple[Image.Image, Image.Image]:
+    """Create two random 2x2-expanded shares for a (2, 2) VCS.
+
+    Each block in Share 1 contains two white and two black subpixels. For a
+    white source pixel, Share 2 uses the same block; for a black source pixel,
+    it uses the complementary block. The low two bits of OS-generated random
+    bytes select among four balanced patterns, so every pattern is equiprobable.
     """
-    (2, 2) 门限可视密码分解
-    像素扩展度 m = 4 (子块 2x2，每个子块包含 2 个黑色像素与 2 个白色像素)
-    """
-    h, w = binary_img.shape
-    share1 = np.zeros((h * 2, w * 2), dtype=np.uint8)
-    share2 = np.zeros((h * 2, w * 2), dtype=np.uint8)
+    binary = np.asarray(binary_img)
+    if binary.ndim != 2 or binary.size == 0:
+        raise ValueError("binary_img must be a non-empty 2D array")
+    binary = (binary > 0).astype(np.uint8)
+    height, width = binary.shape
 
-    # 基础矩阵对应的 4 种 2x2 子块置换模式 (0: 黑色, 255: 白色)
-    patterns = [
-        np.array([[255, 0], [0, 255]], dtype=np.uint8),
-        np.array([[0, 255], [255, 0]], dtype=np.uint8),
-        np.array([[255, 255], [0, 0]], dtype=np.uint8),
-        np.array([[0, 0], [255, 255]], dtype=np.uint8)
-    ]
+    patterns = np.array(
+        [
+            [[255, 0], [0, 255]],
+            [[0, 255], [255, 0]],
+            [[255, 255], [0, 0]],
+            [[0, 0], [255, 255]],
+        ],
+        dtype=np.uint8,
+    )
 
-    for i in range(h):
-        for j in range(w):
-            base_p = patterns[np.random.randint(4)]
-            share1[i * 2:(i + 1) * 2, j * 2:(j + 1) * 2] = base_p
+    pattern_ids = np.frombuffer(
+        secrets.token_bytes(height * width), dtype=np.uint8
+    ).reshape(height, width) & 0b11
+    blocks = patterns[pattern_ids]
+    complementary_blocks = 255 - blocks
+    share2_blocks = np.where(binary[:, :, None, None] == 1, blocks, complementary_blocks)
 
-            if binary_img[i, j] == 1:
-                # 白色像素：两张 share 取相同子块
-                share2[i * 2:(i + 1) * 2, j * 2:(j + 1) * 2] = base_p
-            else:
-                # 黑色像素：两张 share 取互补子块
-                share2[i * 2:(i + 1) * 2, j * 2:(j + 1) * 2] = 255 - base_p
-
+    share1 = blocks.transpose(0, 2, 1, 3).reshape(height * 2, width * 2)
+    share2 = share2_blocks.transpose(0, 2, 1, 3).reshape(height * 2, width * 2)
     return Image.fromarray(share1), Image.fromarray(share2)
 
 
 def overlay_shares(share1_img: Image.Image, share2_img: Image.Image) -> Image.Image:
-    """物理叠合模拟 (取像素灰度最小值，等价于光强吸收累加)"""
-    arr1 = np.array(share1_img)
-    arr2 = np.array(share2_img)
-    return Image.fromarray(np.minimum(arr1, arr2))
+    """Simulate physical stacking by keeping only subpixels white in both shares."""
+    share1 = np.asarray(share1_img.convert("L"))
+    share2 = np.asarray(share2_img.convert("L"))
+    if share1.shape != share2.shape:
+        raise ValueError("the two shares must have the same dimensions")
+    return Image.fromarray(np.minimum(share1, share2))
 
 
 def calculate_shannon_entropy(img_array: np.ndarray) -> float:
-    """计算图像香农信息熵"""
-    bin_data = (img_array > 128).astype(int).flatten()
-    counts = np.bincount(bin_data, minlength=2)
-    probs = counts / len(bin_data)
-    probs = probs[probs > 0]
-    return float(-np.sum(probs * np.log2(probs)))
+    """Calculate the Shannon entropy of a binary or grayscale image in bits."""
+    array = np.asarray(img_array)
+    if array.size == 0:
+        return 0.0
+    if float(np.max(array)) <= 1.0:
+        bits = (array > 0).astype(np.uint8)
+    else:
+        bits = (array > 128).astype(np.uint8)
+    counts = np.bincount(bits.ravel(), minlength=2)
+    probabilities = counts[counts > 0] / bits.size
+    return float(-np.sum(probabilities * np.log2(probabilities)))
 
 
 def calculate_adjacent_correlation(
-    img_array: np.ndarray, num_samples: int = 2000, direction: str = "horizontal"
+    img_array: np.ndarray,
+    num_samples: int = 2000,
+    direction: str = "horizontal",
+    seed: int = 0,
 ) -> tuple[float, np.ndarray, np.ndarray]:
-    """计算相邻像素的皮尔逊相关系数并返回采样分布点"""
-    arr = img_array.astype(float)
-    h, w = arr.shape
+    """Estimate adjacent-pixel Pearson correlation and return jittered plot points.
 
+    Sampling and display jitter use a fixed diagnostic seed to keep reports
+    reproducible. This RNG is only for analysis; share generation uses OS entropy.
+    """
+    array = np.asarray(img_array, dtype=float)
+    if array.ndim != 2 or array.size == 0:
+        raise ValueError("img_array must be a non-empty 2D array")
+    if num_samples < 1:
+        raise ValueError("num_samples must be positive")
+    if direction not in {"horizontal", "vertical"}:
+        raise ValueError("direction must be 'horizontal' or 'vertical'")
+
+    height, width = array.shape
+    pair_count = (
+        height * max(width - 1, 0)
+        if direction == "horizontal"
+        else max(height - 1, 0) * width
+    )
+    rng = np.random.default_rng(seed)
+    if pair_count == 0:
+        empty = np.array([], dtype=float)
+        return 0.0, empty, empty
+
+    positions = rng.choice(pair_count, size=min(num_samples, pair_count), replace=False)
     if direction == "horizontal":
-        x_coords = np.random.randint(0, h, num_samples)
-        y_coords = np.random.randint(0, w - 1, num_samples)
-        x = arr[x_coords, y_coords]
-        y = arr[x_coords, y_coords + 1]
+        rows, columns = np.divmod(positions, width - 1)
+        x, y = array[rows, columns], array[rows, columns + 1]
     else:
-        x_coords = np.random.randint(0, h - 1, num_samples)
-        y_coords = np.random.randint(0, w, num_samples)
-        x = arr[x_coords, y_coords]
-        y = arr[x_coords + 1, y_coords]
+        rows, columns = np.divmod(positions, width)
+        x, y = array[rows, columns], array[rows + 1, columns]
 
-    # 添加轻微扰动便于散点可视化观察局部密度
-    x_scatter = x + np.random.normal(0, 3, num_samples)
-    y_scatter = y + np.random.normal(0, 3, num_samples)
+    centered_x = x - np.mean(x)
+    centered_y = y - np.mean(y)
+    denominator = np.sqrt(np.sum(centered_x**2) * np.sum(centered_y**2))
+    correlation = (
+        0.0
+        if denominator == 0
+        else float(np.sum(centered_x * centered_y) / denominator)
+    )
 
-    mean_x, mean_y = float(np.mean(x)), float(np.mean(y))
-    cov_xy = float(np.sum((x - mean_x) * (y - mean_y)))
-    var_prod = float(np.sqrt(np.sum((x - mean_x) ** 2) * np.sum((y - mean_y) ** 2)))
-
-    r = 0.0 if var_prod == 0 else cov_xy / var_prod
-    return float(r), x_scatter, y_scatter
+    x_scatter = x + rng.normal(0, 3, size=x.size)
+    y_scatter = y + rng.normal(0, 3, size=y.size)
+    return correlation, x_scatter, y_scatter
 
 
-def calculate_theoretical_contrast(binary_orig: np.ndarray, recovered_img: Image.Image) -> dict:
-    """评估重构图像的白区透光率、黑区透光率及相对对比度 alpha"""
-    orig_h, orig_w = binary_orig.shape
-    rec_arr = np.array(recovered_img)
+def calculate_share_balance(binary_img: np.ndarray, share_img: Image.Image) -> dict[str, float]:
+    """Compare a share's white-pixel rate over white and black source blocks.
 
-    white_mask = np.repeat(np.repeat(binary_orig == 1, 2, axis=0), 2, axis=1)
+    A zero difference is an empirical check that this share's pixel balance does
+    not reveal which source-pixel class it came from.
+    """
+    binary = np.asarray(binary_img)
+    if binary.ndim != 2 or binary.size == 0:
+        raise ValueError("binary_img must be a non-empty 2D array")
+    share = np.asarray(share_img.convert("L"))
+    expected_shape = (binary.shape[0] * 2, binary.shape[1] * 2)
+    if share.shape != expected_shape:
+        raise ValueError("share dimensions must be exactly twice the source dimensions")
+
+    source_white = np.repeat(np.repeat(binary > 0, 2, axis=0), 2, axis=1)
+    share_white = share > 128
+    rates: dict[str, float] = {}
+    for label, mask in (("white_source_rate", source_white), ("black_source_rate", ~source_white)):
+        rates[label] = float(np.mean(share_white[mask])) if np.any(mask) else float("nan")
+
+    white_rate = rates["white_source_rate"]
+    black_rate = rates["black_source_rate"]
+    rates["balance_gap"] = (
+        abs(white_rate - black_rate)
+        if np.isfinite(white_rate) and np.isfinite(black_rate)
+        else float("nan")
+    )
+    return rates
+
+
+def calculate_theoretical_contrast(binary_orig: np.ndarray, recovered_img: Image.Image) -> dict[str, float]:
+    """Measure recovered white transmission and contrast alpha.
+
+    For the 2x2 basis used here, an original white pixel retains two white
+    subpixels (transmission 0.5); a black pixel retains none (transmission 0).
+    """
+    binary = np.asarray(binary_orig)
+    if binary.ndim != 2 or binary.size == 0:
+        raise ValueError("binary_orig must be a non-empty 2D array")
+    recovered = np.asarray(recovered_img.convert("L"))
+    expected_shape = (binary.shape[0] * 2, binary.shape[1] * 2)
+    if recovered.shape != expected_shape:
+        raise ValueError("recovered image dimensions must be exactly twice the source dimensions")
+
+    white_mask = np.repeat(np.repeat(binary > 0, 2, axis=0), 2, axis=1)
     black_mask = ~white_mask
-
-    t_white = float(np.mean(rec_arr[white_mask] == 255)) if np.sum(white_mask) > 0 else 0.5
-    t_black = float(np.mean(rec_arr[black_mask] == 255)) if np.sum(black_mask) > 0 else 0.0
-
+    recovered_white = recovered > 128
+    t_white = float(np.mean(recovered_white[white_mask])) if np.any(white_mask) else 0.5
+    t_black = float(np.mean(recovered_white[black_mask])) if np.any(black_mask) else 0.0
     return {
         "t_white": t_white,
         "t_black": t_black,
-        "contrast_alpha": t_white - t_black
+        "contrast_alpha": t_white - t_black,
     }

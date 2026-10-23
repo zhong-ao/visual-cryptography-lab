@@ -1,2 +1,10 @@
 __pycache__/
 *.pyc
+.venv/
+venv/
+.streamlit/secrets.toml
+*.clnote
+*.vclab
+visual_secret_shares.zip
+share_1.png
+share_2.png
